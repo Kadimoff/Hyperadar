@@ -41,10 +41,12 @@ class ChatMeter:
     def __init__(self, on_spike: Optional[Callable[[str, dict], None]] = None):
         self.buckets: dict[str, deque] = defaultdict(lambda: deque(maxlen=KEEP))  # (bucket_ts, msgs, hype)
         self.last_spike: dict[str, float] = {}
+        self.samples: dict[str, deque] = defaultdict(lambda: deque(maxlen=600))  # (ts, user, text)
         self.on_spike = on_spike
 
-    def add(self, key: str, text: str, now: Optional[float] = None) -> None:
+    def add(self, key: str, text: str, now: Optional[float] = None, user: Optional[str] = None) -> None:
         now = now or time.time()
+        self.samples[key].append((now, user, text))
         b = int(now // BUCKET) * BUCKET
         dq = self.buckets[key]
         if dq and dq[-1][0] == b:
@@ -65,7 +67,10 @@ class ChatMeter:
             return
         self.last_spike[key] = now_bucket
         if self.on_spike:
-            self.on_spike(key, {"at": closed[0], "msgs": closed[1], "hype": closed[2], "z": round(z, 1)})
+            # messages of the spike bucket and the one before it (the ramp-up)
+            win = [x for x in self.samples.get(key, ()) if closed[0] - BUCKET <= x[0] < closed[0] + BUCKET]
+            self.on_spike(key, {"at": closed[0], "msgs": closed[1], "hype": closed[2], "z": round(z, 1),
+                                "samples": win})
 
     def rate(self, key: str, window: int = 60, now: Optional[float] = None) -> Optional[dict]:
         """Messages and hype-word messages per minute over the last ``window`` seconds."""
@@ -83,3 +88,4 @@ class ChatMeter:
 
     def drop(self, key: str) -> None:
         self.buckets.pop(key, None)
+        self.samples.pop(key, None)

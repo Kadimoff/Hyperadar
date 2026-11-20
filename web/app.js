@@ -10,7 +10,7 @@ const KIND_LABEL = { clip: "Klip", video: "Video", chat_spike: "Chat partlayış
 const SIGNAL_LABEL = { size: "İzləyici sayı", growth: "Artım, 10 dəq", chat: "Chat sürəti", clips: "Klip aktivliyi" };
 
 const state = {
-  tags: [], tag: null, tab: "live",
+  tags: [], tag: null, tab: "live", showRejected: false, hiddenCount: 0,
   platforms: new Set(PLATFORMS.map(p => p.id)), lang: "", minQ: 0, q: "",
   items: [], liveCount: 0, momentCount: 0, clipCount: 0, updated: null,
   selected: null, selectedItem: null, status: null, settings: null, active: {}, progress: [],
@@ -195,6 +195,7 @@ $("#platToggles").addEventListener("click", e => {
   b.setAttribute("aria-pressed", state.platforms.has(p));
   refresh(true);
 });
+$("#rejSel").addEventListener("change", e => { state.showRejected = e.target.checked; refresh(true); });
 $("#langSel").addEventListener("change", e => { state.lang = e.target.value; refresh(true); });
 $("#qualSel").addEventListener("change", e => { state.minQ = Number(e.target.value); refresh(true); });
 let searchT;
@@ -204,6 +205,7 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   document.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-selected", x === t));
   $("#qualSel").disabled = state.tab !== "live";
   $("#langSel").disabled = state.tab === "clips";
+  $("#rejWrap").hidden = state.tab !== "moments";
   state.selected = null; state.selectedItem = null; renderStage();
   refresh(true);
 }));
@@ -224,8 +226,9 @@ async function refresh(reset = false) {
       const d = await (await fetch("/api/live?" + qs, { signal: ctl.signal })).json();
       state.items = d.items; state.updated = d.updated; state.liveCount = d.total;
     } else if (state.tab === "moments") {
+      if (state.showRejected) qs.set("show_rejected", "true");
       const d = await (await fetch("/api/moments?" + qs, { signal: ctl.signal })).json();
-      state.items = d.items; state.momentCount = d.items.length;
+      state.items = d.items; state.momentCount = d.items.length; state.hiddenCount = d.hidden || 0;
     } else {
       const all = await (await fetch("/api/clips", { signal: ctl.signal })).json();
       const q = state.q.toLowerCase();
@@ -287,6 +290,11 @@ function liveRow(it) {
     ${heatBar(it.hype)}
   </article>`;
 }
+function rejectChips(it) {
+  if (it.rejected) return (it.reasons || []).map(r => `<span class="chip perm-denied" title="Klip üçün uyğun deyil">${esc(r)}</span>`).join("");
+  if (it.extra?.flags?.length) return it.extra.flags.map(f => `<span class="chip" title="Diqqət">${esc(f)}</span>`).join("");
+  return "";
+}
 function momentRow(it, i) {
   const age = ago(it.created_at);
   const kind = KIND_LABEL[it.kind] || it.kind;
@@ -296,7 +304,7 @@ function momentRow(it, i) {
     <div class="who">
       <div class="name">${esc(it.display_name)} ${it.language ? `<span class="lang">${esc(it.language.toUpperCase().slice(0, 2))}</span>` : ""}</div>
       <div class="title" title="${esc(it.title)}">${esc(it.title)}</div>
-      <div class="chips"><span class="chip ${it.kind === "chat_spike" ? "spike" : ""}">${kind}</span><span class="chip">${age}</span>${it.vod_url ? `<span class="chip">VOD anı var</span>` : ""}${permChip(it.permission)}</div>
+      <div class="chips"><span class="chip ${it.kind === "chat_spike" ? "spike" : ""}">${kind}</span><span class="chip">${age}</span>${it.vod_url ? `<span class="chip">VOD anı var</span>` : ""}${permChip(it.permission)}${rejectChips(it)}</div>
     </div>
     <div class="num numcol"><b>${compact(it.views)}</b><small>${it.kind === "chat_spike" ? "izləyici" : "baxış"}</small></div>
     <div class="num chatcol">${it.views_per_hour ? `<b>${compact(it.views_per_hour)}</b><small>baxış/saat</small>` : `<b>–</b><small></small>`}</div>
@@ -519,7 +527,7 @@ function updateStageStats() {
         <div class="mini"><i style="width:${na ? 50 : Math.round(v * 100)}%;${na ? "opacity:.3" : ""}"></i></div>${na ? `<small style="color:var(--faint)">${why}</small>` : ""}</div>`;
     }).join("")}</div>`;
   } else if (it.kind === "chat_spike" && it.extra) {
-    $("#stageBreak").innerHTML = `<p class="hint">10 saniyədə ${it.extra.msgs} mesaj, normadan ${it.extra.z} standart sapma yuxarı. ${it.extra.hype} mesajda hype sözləri var.</p>`;
+    $("#stageBreak").innerHTML = `<p class="hint">10 saniyədə ${it.extra.msgs} mesaj, normadan ${it.extra.z} standart sapma yuxarı. ${it.extra.hype} mesajda hype sözləri var.${it.extra.quality != null ? ` Keyfiyyət balı: ${Math.round(it.extra.quality)}.` : ""}${it.rejected ? ` <b>Rədd: ${esc((it.reasons || []).join(", "))}.</b>` : ""}</p>`;
   } else {
     $("#stageBreak").innerHTML = it.views_per_hour ? `<p class="hint">Saatda ${compact(it.views_per_hour)} baxış. Bu tempə görə sıralanıb.</p>` : "";
   }
@@ -602,12 +610,16 @@ async function act(kind) {
       const what = r.detail.includes("created") ? "HypeRadar mənbəyi yaradıldı" : "HypeRadar mənbəyi yeniləndi";
       toast(`${r.detail.startsWith("OBS açıldı") ? "OBS açıldı. " : ""}${it.display_name} OBS-ə göndərildi: ${what}`);
     } else if (kind === "clip") {
-      const r = await api("/api/actions/clip", { method: "POST", body: JSON.stringify({ key: it.key }) });
+      const r = await api("/api/actions/clip", { method: "POST", body: JSON.stringify({ key: it.key, force: !!it._force }) });
       state.active[it.key] = r.job; renderStage(); pollProgress();
       toast(it.kind ? `Klip hazırlanır. Faizi "Hazır kliplər" bölməsində görəcəksiniz.` : `Canlı klip sessiyası başladı: hype anları avtomatik "Hazır kliplər"ə düşəcək.`);
     }
   } catch (err) {
     const settingsHint = /Ayarlar|qoşulmayıb|parol/i.test(err.message);
+    if (/^Uyğun deyil/.test(err.message)) {
+      toast(err.message, "err", { label: "Yenə də klip et", run: () => { it._force = true; act("clip"); } });
+      return;
+    }
     toast(err.message, "err", settingsHint ? { label: "Ayarlar", run: openSettings } : null);
   } finally {
     btn && (btn.disabled = it.permission === "denied" && kind === "clip");

@@ -233,3 +233,48 @@ def test_render_progress_uses_ffmpeg_time():
     from engine.actions.clipper import parse_progress
     text = "[x] render 2/2\n> ffmpeg -y -ss 1 -i a.mp4 -t 10.0 -filter_complex z\nframe= 1 time=00:00:05.00 bitrate"
     assert parse_progress(text) == {"percent": round(65 + 34 * 1.5 / 2), "stage": "Render 2/2"}
+
+
+# --- moment quality ----------------------------------------------------------
+from engine.scoring import moment_quality as MQ  # noqa: E402
+
+
+def _samples(rows):
+    return [(1000.0 + i, u, t) for i, (u, t) in enumerate(rows)]
+
+
+def test_spam_spike_rejected():
+    s = _samples([(f"bot{i % 2}", "FOLLOW ME !join") for i in range(40)])
+    v = MQ.analyze(s, {"z": 8, "msgs": 40, "hype": 0}, "Valorant ranked", "Valorant")
+    assert not v["ok"] and v["quality"] <= 30
+
+
+def test_real_reaction_accepted():
+    words = ["wtf", "how??", "no way", "bug?", "omg", "KEKW", "what was that", "clip it", "bro", "LMAO"]
+    s = _samples([(f"user{i}", words[i % 10]) for i in range(30)])
+    v = MQ.analyze(s, {"z": 6, "msgs": 30, "hype": 15}, "GTA 6 chaos", "Grand Theft Auto VI")
+    assert v["ok"] and v["quality"] > 50
+
+
+def test_unsafe_and_category_rejected():
+    s = _samples([(f"u{i}", f"nsfw lol {i}") for i in range(12)])
+    assert "18+" in MQ.analyze(s, {"z": 5, "msgs": 12, "hype": 3}, "t", "g")["reasons"]
+    s2 = _samples([(f"u{i}", f"wow {i}") for i in range(12)])
+    assert not MQ.analyze(s2, {"z": 5, "msgs": 12, "hype": 3}, "fun", "Pools, Hot Tubs & Beaches")["ok"]
+
+
+def test_no_text_is_neutral():
+    assert MQ.analyze(None, {"z": 4, "msgs": 20, "hype": 5}, "Fortnite", "Fortnite")["ok"]
+
+
+def test_meter_keeps_samples():
+    got = []
+    m = ChatMeter(on_spike=lambda k, i: got.append(i))
+    t = 2_000_000.0
+    for b in range(30):
+        for i in range(5):
+            m.add("k", "hi", now=t + b * 10 + i, user=f"u{i}")
+    for i in range(60):
+        m.add("k", "wtf", now=t + 300 + i * 0.1, user=f"v{i}")
+    m.add("k", "x", now=t + 311, user="z")
+    assert got and got[0]["samples"] and got[0]["samples"][-1][1].startswith("v")

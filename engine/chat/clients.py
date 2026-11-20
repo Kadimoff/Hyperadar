@@ -61,7 +61,8 @@ class TwitchChat:
                                 elif " PRIVMSG #" in line:
                                     rest = line.split(" PRIVMSG #", 1)[1]
                                     ch, _, text = rest.partition(" :")
-                                    self.meter.add(f"twitch:{ch}", text)
+                                    nick = line.split("!", 1)[0].lstrip(":@") if "!" in line else None
+                                    self.meter.add(f"twitch:{ch}", text, user=nick)
                     finally:
                         sync_task.cancel()
             except asyncio.CancelledError:
@@ -153,10 +154,12 @@ class KickChat:
                                 slug = by_chan.get(m.get("channel"))
                                 if slug:
                                     try:
-                                        text = json.loads(m["data"]).get("content", "")
+                                        data = json.loads(m["data"])
+                                        text = data.get("content", "")
+                                        user = (data.get("sender") or {}).get("username")
                                     except Exception:
-                                        text = ""
-                                    self.meter.add(f"kick:{slug}", text)
+                                        text, user = "", None
+                                    self.meter.add(f"kick:{slug}", text, user=user)
                     finally:
                         sync_task.cancel()
             except asyncio.CancelledError:
@@ -225,7 +228,7 @@ class YouTubeChat:
                 msg = item.get("liveChatTextMessageRenderer")
                 if msg:
                     text = "".join(run.get("text", "") for run in (msg.get("message") or {}).get("runs") or [])
-                    self.meter.add(mkey, text)
+                    self.meter.add(mkey, text, user=msg.get("authorExternalChannelId"))
             nxt = next(iter(lc["continuations"][0].values()))
             cont = nxt["continuation"]
             await asyncio.sleep(min(max(nxt.get("timeoutMs", 5000), 1500), 10000) / 1000)

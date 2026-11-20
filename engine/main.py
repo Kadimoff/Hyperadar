@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from .actions import clipper
 from .actions.obs import OBSError, record, show_in_obs
 from .core import Engine
+from .scoring import blocklist
 
 ROOT = Path(__file__).resolve().parent.parent
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -119,11 +120,14 @@ async def live(tag: int, platforms: Optional[str] = None, lang: Optional[str] = 
 
 @app.get("/api/moments")
 async def moments(tag: int, platforms: Optional[str] = None, lang: Optional[str] = None, q: Optional[str] = None,
-                  kind: Optional[str] = None, limit: int = Query(80, le=300)):
+                  kind: Optional[str] = None, show_rejected: bool = False, limit: int = Query(80, le=300)):
     rows = _filter(engine.moments_for(tag), platforms, lang, q)
+    hidden = sum(1 for r in rows if r.get("rejected"))
+    if not show_rejected:
+        rows = [r for r in rows if not r.get("rejected")]
     if kind:
         rows = [r for r in rows if r["kind"] == kind]
-    return {"items": rows[:limit]}
+    return {"items": rows[:limit], "hidden": hidden}
 
 
 @app.get("/api/history")
@@ -199,6 +203,7 @@ async def set_permission(body: PermIn):
 # --- actions --------------------------------------------------------------
 class ActionIn(BaseModel):
     key: str
+    force: bool = False
 
 
 @app.post("/api/actions/obs")
@@ -244,6 +249,8 @@ async def action_clip(body: ActionIn):
     perm = engine.permissions.get(f"{item['platform']}:{item['channel']}", "unknown")
     if perm == "denied":
         raise HTTPException(403, "Bu yayımçı klipə icazə verməyib")
+    if item.get("rejected") and not body.force:
+        raise HTTPException(422, "Uyğun deyil: " + ", ".join(item.get("reasons") or ["naməlum"]))
     missing = clipper.describe_missing(engine.settings.get("chopify_dir"))
     if missing:
         raise HTTPException(409, missing)
@@ -295,6 +302,14 @@ async def action_clip(body: ActionIn):
         detail = (f"Dayandırıldı. {len(clips)} klip hazırdır" if status == "stopped"
                   else f"{len(clips)} klip hazırdır: {out_dir}" if rc == 0
                   else clipper.failure_reason(Path(out_dir) / "chopify.log") or f"exit {rc}")
+        for c in clips:      # flag unsafe clips from chopify's own title/transcript (text only)
+            try:
+                meta = json.loads(c.with_suffix(".meta.json").read_text())
+                texts = [meta.get("title") or "", meta.get("transcript") or "", meta.get("text") or ""]
+                hit = blocklist.scan(texts, engine.settings.get("custom_blocklist"))
+                c.with_suffix(".flags.json").write_text(json.dumps(hit, ensure_ascii=False))
+            except (OSError, ValueError):
+                pass
         await engine.db.update_job(job, status, detail)
         engine.publish("job", {"id": job, "status": status, "detail": detail, "clips": [c.name for c in clips],
                                "key": body.key})
@@ -328,6 +343,10 @@ async def finished_clips():
         except (OSError, ValueError):
             pass
         poster = mp4.with_suffix(".png")
+        try:
+            flags = json.loads(mp4.with_suffix(".flags.json").read_text())
+        except (OSError, ValueError):
+            flags = {"hard": [], "soft": []}
         title = src.get("title") or meta.get("title") or mp4.stem
         credit = f"🎮 {src['display_name']} · {src['channel_url']}" if src.get("display_name") else ""
         tags = " ".join(meta.get("hashtags") or ["#shorts"])
@@ -336,7 +355,7 @@ async def finished_clips():
             "poster": "/media/" + quote(str(rel.with_suffix(".png"))) if poster.exists() else None,
             "title": title, "chopify_title": meta.get("title"), "score": meta.get("score"),
             "duration": (meta.get("end") or 0) - (meta.get("start") or 0) or None,
-            "created": mp4.stat().st_mtime, "size": mp4.stat().st_size, "source": src,
+            "created": mp4.stat().st_mtime, "size": mp4.stat().st_size, "source": src, "flags": flags,
             "description": "\n".join(x for x in (title, credit, tags) if x),
         })
     out.sort(key=lambda c: c["created"], reverse=True)

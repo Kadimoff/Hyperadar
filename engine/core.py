@@ -18,6 +18,7 @@ from .connectors.registry import CONNECTORS
 from .db import DB
 from .models import Moment, Stream
 from .scoring import hype as H
+from .scoring import moment_quality as MQ
 from .scoring.quality import best_variant, quality_score
 
 log = logging.getLogger("engine")
@@ -29,6 +30,9 @@ DEFAULT_SETTINGS = {
     "chat_top_n": 15,
     "obs": {"host": "localhost", "port": 4455, "password": ""},
     "chopify_dir": "",
+    "min_chatters": 4,
+    "min_unique_ratio": 0.4,
+    "custom_blocklist": [],
 }
 
 VOD_Q = """query($login: String!) { user(login: $login) {
@@ -291,18 +295,29 @@ class Engine:
                     vod_url = f"https://www.twitch.tv/videos/{edges[0]['node']['id']}?t={max(0, int(info['at'] - vod_created - 20))}s"
             except Exception as e:
                 log.info("vod lookup failed for %s: %s", s["channel"], e)
+        samples = info.pop("samples", None)
+        verdict = MQ.analyze(samples, info, s.get("title") or "", s.get("category") or "",
+                             {k: self.settings.get(k) for k in ("min_chatters", "min_unique_ratio", "custom_blocklist")
+                              if self.settings.get(k) is not None})
         m = Moment(platform=s["platform"], id=f"{s['channel']}-{int(info['at'])}", kind="chat_spike",
                    title=f"Chat partlayışı · {info['msgs']} mesaj/10 san (z={info['z']})",
                    channel=s["channel"], display_name=s["display_name"], views=s["viewers"],
                    created_at=datetime.fromtimestamp(info["at"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    url=s["url"], thumbnail=s.get("thumbnail"), language=s.get("language"), vod_url=vod_url,
-                   extra={**info, "offset": offset})
+                   extra={**info, "offset": offset, "quality": verdict["quality"], "flags": verdict["flags"]})
         d = m.to_dict()
         d["embed"] = s.get("embed")
-        d["hype"] = round(min(100.0, 60 + info["z"] * 5 + (info["hype"] / max(info["msgs"], 1)) * 20), 1)
+        # text-aware score when chat text exists; the old count-only formula otherwise
+        base = 60 + info["z"] * 5 + (info["hype"] / max(info["msgs"], 1)) * 20
+        d["hype"] = round(min(100.0, base if not samples else 40 + verdict["quality"] * 0.6), 1)
+        d["rejected"] = not verdict["ok"]
+        d["reasons"] = verdict["reasons"]
         d["permission"] = s.get("permission", "unknown")
         self.spikes[tag_id].appendleft(d)
-        self.publish("spike", {"tag_id": tag_id, "moment": d})
+        if verdict["ok"]:
+            self.publish("spike", {"tag_id": tag_id, "moment": d})
+        else:
+            log.info("spike %s hidden: %s", d["key"], ", ".join(verdict["reasons"]))
 
     # quality ----------------------------------------------------------------
     async def _quality_loop(self) -> None:
